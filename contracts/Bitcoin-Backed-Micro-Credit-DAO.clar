@@ -9,6 +9,8 @@
 (define-constant ERR-INSUFFICIENT-COLLATERAL (err u107))
 (define-constant ERR-COLLATERAL-LOCKED (err u108))
 (define-constant ERR-INSUFFICIENT-INTEREST-PAYMENT (err u109))
+(define-constant ERR-MAX-EXTENSIONS-REACHED (err u110))
+(define-constant ERR-EXTENSION-NOT-ALLOWED (err u111))
 
 ;; Data variables
 (define-data-var pool-balance uint u0)
@@ -18,11 +20,13 @@
 (define-data-var total-collateral uint u0)
 (define-data-var base-interest-rate uint u500)
 (define-data-var max-interest-rate uint u2000)
+(define-data-var extension-fee-rate uint u300)
+(define-data-var max-extensions-per-loan uint u3)
 
 ;; Data maps
 (define-map loans 
     { borrower: principal }
-    { amount: uint, due-height: uint, status: (string-ascii 20), collateral-amount: uint, interest-rate: uint, accrued-interest: uint })
+    { amount: uint, due-height: uint, status: (string-ascii 20), collateral-amount: uint, interest-rate: uint, accrued-interest: uint, extensions-used: uint })
 
 (define-map reputation 
     { user: principal }
@@ -55,6 +59,9 @@
 
 (define-private (calculate-accrued-interest (principal-amount uint) (interest-rate uint) (blocks-elapsed uint))
     (/ (* (* principal-amount interest-rate) blocks-elapsed) u5256000))
+
+(define-private (calculate-extension-fee (loan-amount uint))
+    (/ (* loan-amount (var-get extension-fee-rate)) u10000))
 
 ;; Public functions
 (define-public (deposit-collateral (amount uint))
@@ -102,7 +109,8 @@
               status: "active",
               collateral-amount: required-collateral,
               interest-rate: loan-interest-rate,
-              accrued-interest: u0 })
+              accrued-interest: u0,
+              extensions-used: u0 })
         (map-set collateral-balances
             { user: tx-sender }
             { locked: (+ (get locked current-collateral) required-collateral),
@@ -193,7 +201,8 @@
               status: (get status loan),
               collateral-amount: (get collateral-amount loan),
               interest-rate: (get interest-rate loan),
-              accrued-interest: (+ (get accrued-interest loan) interest-owed) })
+              accrued-interest: (+ (get accrued-interest loan) interest-owed),
+              extensions-used: (get extensions-used loan) })
         (var-set pool-balance (+ (var-get pool-balance) interest-owed))
         (ok true)))
 
@@ -205,6 +214,40 @@
     (match (map-get? loans { borrower: borrower })
         loan (let ((blocks-elapsed (- stacks-block-height (- (get due-height loan) u144))))
                 (ok (calculate-accrued-interest (get amount loan) (get interest-rate loan) blocks-elapsed)))
+        ERR-NO-LOAN-EXISTS))
+
+(define-public (extend-loan (extension-blocks uint))
+    (let ((loan (unwrap! (map-get? loans { borrower: tx-sender }) ERR-NO-LOAN-EXISTS))
+          (extension-fee (calculate-extension-fee (get amount loan)))
+          (new-extensions-count (+ (get extensions-used loan) u1)))
+        (asserts! (< (get extensions-used loan) (var-get max-extensions-per-loan)) ERR-MAX-EXTENSIONS-REACHED)
+        (asserts! (< stacks-block-height (get due-height loan)) ERR-EXTENSION-NOT-ALLOWED)
+        (asserts! (>= (stx-get-balance tx-sender) extension-fee) ERR-INSUFFICIENT-BALANCE)
+        (try! (stx-transfer? extension-fee tx-sender (as-contract tx-sender)))
+        (map-set loans
+            { borrower: tx-sender }
+            { amount: (get amount loan),
+              due-height: (+ (get due-height loan) extension-blocks),
+              status: (get status loan),
+              collateral-amount: (get collateral-amount loan),
+              interest-rate: (get interest-rate loan),
+              accrued-interest: (get accrued-interest loan),
+              extensions-used: new-extensions-count })
+        (var-set pool-balance (+ (var-get pool-balance) extension-fee))
+        (ok true)))
+
+(define-read-only (get-extension-eligibility (borrower principal))
+    (match (map-get? loans { borrower: borrower })
+        loan (let ((current-extensions (get extensions-used loan))
+                   (max-extensions (var-get max-extensions-per-loan))
+                   (loan-due (get due-height loan)))
+                (ok { 
+                    eligible: (and 
+                        (< current-extensions max-extensions)
+                        (< stacks-block-height loan-due)),
+                    extensions-used: current-extensions,
+                    extensions-remaining: (- max-extensions current-extensions),
+                    extension-fee: (calculate-extension-fee (get amount loan)) }))
         ERR-NO-LOAN-EXISTS))
 
 (define-read-only (get-total-collateral)
