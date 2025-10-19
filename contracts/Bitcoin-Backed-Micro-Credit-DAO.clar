@@ -252,3 +252,246 @@
 
 (define-read-only (get-total-collateral)
     (ok (var-get total-collateral)))
+
+;; ==========================================
+;; LOAN ANALYTICS & PERFORMANCE TRACKING SYSTEM
+;; ==========================================
+
+;; Additional error constants for analytics
+(define-constant ERR-ANALYTICS-NOT-INITIALIZED (err u200))
+(define-constant ERR-INVALID-TIME-PERIOD (err u201))
+(define-constant ERR-INSUFFICIENT-DATA (err u202))
+
+;; Analytics data variables
+(define-data-var total-loans-issued uint u0)
+(define-data-var total-loans-repaid uint u0)
+(define-data-var total-loans-defaulted uint u0)
+(define-data-var total-interest-earned uint u0)
+(define-data-var analytics-initialized bool false)
+(define-data-var last-analytics-update uint u0)
+
+;; Performance tracking maps
+(define-map borrower-analytics
+    { borrower: principal }
+    { 
+        total-borrowed: uint,
+        total-repaid: uint,
+        loans-count: uint,
+        default-count: uint,
+        avg-repayment-time: uint,
+        performance-score: uint,
+        last-loan-date: uint
+    })
+
+(define-map lending-pool-snapshots
+    { snapshot-id: uint }
+    {
+        timestamp: uint,
+        pool-size: uint,
+        active-loans: uint,
+        total-collateral: uint,
+        utilization-rate: uint,
+        avg-interest-rate: uint
+    })
+
+(define-map daily-analytics
+    { date-block: uint }
+    {
+        loans-issued: uint,
+        loans-repaid: uint,
+        volume-issued: uint,
+        volume-repaid: uint,
+        interest-collected: uint,
+        new-borrowers: uint
+    })
+
+;; Analytics initialization
+(define-public (initialize-analytics)
+    (begin
+        (asserts! (not (var-get analytics-initialized)) ERR-ANALYTICS-NOT-INITIALIZED)
+        (var-set analytics-initialized true)
+        (var-set last-analytics-update stacks-block-height)
+        (map-set lending-pool-snapshots
+            { snapshot-id: u0 }
+            {
+                timestamp: stacks-block-height,
+                pool-size: (var-get pool-balance),
+                active-loans: (var-get total-loans),
+                total-collateral: (var-get total-collateral),
+                utilization-rate: (calculate-pool-utilization),
+                avg-interest-rate: (var-get base-interest-rate)
+            })
+        (ok true)))
+
+;; Update borrower analytics on loan request
+(define-public (update-analytics-on-borrow (amount uint))
+    (let ((current-analytics (default-to 
+                                {
+                                    total-borrowed: u0,
+                                    total-repaid: u0,
+                                    loans-count: u0,
+                                    default-count: u0,
+                                    avg-repayment-time: u0,
+                                    performance-score: u100,
+                                    last-loan-date: u0
+                                }
+                                (map-get? borrower-analytics { borrower: tx-sender }))))
+        (map-set borrower-analytics
+            { borrower: tx-sender }
+            {
+                total-borrowed: (+ (get total-borrowed current-analytics) amount),
+                total-repaid: (get total-repaid current-analytics),
+                loans-count: (+ (get loans-count current-analytics) u1),
+                default-count: (get default-count current-analytics),
+                avg-repayment-time: (get avg-repayment-time current-analytics),
+                performance-score: (get performance-score current-analytics),
+                last-loan-date: stacks-block-height
+            })
+        (var-set total-loans-issued (+ (var-get total-loans-issued) u1))
+        (ok true)))
+
+;; Update borrower analytics on loan repayment
+(define-public (update-analytics-on-repay (amount uint))
+    (let ((current-analytics (default-to 
+                                {
+                                    total-borrowed: u0,
+                                    total-repaid: u0,
+                                    loans-count: u0,
+                                    default-count: u0,
+                                    avg-repayment-time: u0,
+                                    performance-score: u100,
+                                    last-loan-date: u0
+                                }
+                                (map-get? borrower-analytics { borrower: tx-sender }))))
+        (map-set borrower-analytics
+            { borrower: tx-sender }
+            {
+                total-borrowed: (get total-borrowed current-analytics),
+                total-repaid: (+ (get total-repaid current-analytics) amount),
+                loans-count: (get loans-count current-analytics),
+                default-count: (get default-count current-analytics),
+                avg-repayment-time: (get avg-repayment-time current-analytics),
+                performance-score: (if (> (+ (get performance-score current-analytics) u10) u1000) u1000 (+ (get performance-score current-analytics) u10)),
+                last-loan-date: (get last-loan-date current-analytics)
+            })
+        (var-set total-loans-repaid (+ (var-get total-loans-repaid) u1))
+        (ok true)))
+
+;; Create daily analytics snapshot
+(define-public (create-daily-snapshot)
+    (let ((today-block (/ stacks-block-height u144))
+          (current-snapshot (default-to
+                                {
+                                    loans-issued: u0,
+                                    loans-repaid: u0,
+                                    volume-issued: u0,
+                                    volume-repaid: u0,
+                                    interest-collected: u0,
+                                    new-borrowers: u0
+                                }
+                                (map-get? daily-analytics { date-block: today-block }))))
+        (map-set daily-analytics
+            { date-block: today-block }
+            current-snapshot)
+        (var-set last-analytics-update stacks-block-height)
+        (ok true)))
+
+;; Analytics read-only functions
+(define-read-only (get-borrower-performance (borrower principal))
+    (let ((analytics (map-get? borrower-analytics { borrower: borrower })))
+        (match analytics
+            data (let ((repayment-rate (if (> (get loans-count data) u0) 
+                                        (/ (* (- (get loans-count data) (get default-count data)) u10000) (get loans-count data))
+                                        u0))
+                       (avg-loan-size (if (> (get loans-count data) u0)
+                                        (/ (get total-borrowed data) (get loans-count data))
+                                        u0)))
+                    (ok {
+                        borrower: borrower,
+                        total-borrowed: (get total-borrowed data),
+                        total-repaid: (get total-repaid data),
+                        loans-count: (get loans-count data),
+                        default-count: (get default-count data),
+                        repayment-rate: repayment-rate,
+                        performance-score: (get performance-score data),
+                        avg-loan-size: avg-loan-size,
+                        last-activity: (get last-loan-date data)
+                    }))
+            ERR-INSUFFICIENT-DATA)))
+
+(define-read-only (get-pool-analytics)
+    (let ((utilization (calculate-pool-utilization))
+          (default-rate (if (> (var-get total-loans-issued) u0)
+                            (/ (* (var-get total-loans-defaulted) u10000) (var-get total-loans-issued))
+                            u0))
+          (avg-interest (if (> (var-get total-loans-issued) u0)
+                            (/ (var-get total-interest-earned) (var-get total-loans-issued))
+                            u0)))
+        (ok {
+            pool-balance: (var-get pool-balance),
+            total-collateral: (var-get total-collateral),
+            active-loans: (var-get total-loans),
+            total-loans-issued: (var-get total-loans-issued),
+            total-loans-repaid: (var-get total-loans-repaid),
+            total-loans-defaulted: (var-get total-loans-defaulted),
+            utilization-rate: utilization,
+            default-rate: default-rate,
+            total-interest-earned: (var-get total-interest-earned),
+            avg-interest-rate: avg-interest
+        })))
+
+(define-read-only (get-daily-analytics (date-block uint))
+    (match (map-get? daily-analytics { date-block: date-block })
+        data (ok data)
+        ERR-INSUFFICIENT-DATA))
+
+(define-read-only (calculate-risk-score (borrower principal))
+    (match (map-get? borrower-analytics { borrower: borrower })
+        data (let ((default-rate (if (> (get loans-count data) u0)
+                                    (/ (* (get default-count data) u10000) (get loans-count data))
+                                    u0))
+                   (activity-score (if (> stacks-block-height (get last-loan-date data))
+                                     (let ((score-calc (- u1000 (/ (- stacks-block-height (get last-loan-date data)) u1440))))
+                                         (if (< score-calc u0) u0 score-calc))
+                                     u1000))
+                   (volume-score (let ((vol-calc (/ (get total-borrowed data) u1000000)))
+                                    (if (> vol-calc u1000) u1000 vol-calc)))
+                   (composite-score (/ (+ (get performance-score data) activity-score volume-score) u3)))
+                (ok {
+                    borrower: borrower,
+                    risk-score: (- u1000 (if (> default-rate u1000) u1000 default-rate)),
+                    performance-score: (get performance-score data),
+                    activity-score: activity-score,
+                    volume-score: volume-score,
+                    composite-score: composite-score,
+                    recommendation: (if (> composite-score u750) "low-risk" 
+                                       (if (> composite-score u500) "medium-risk" "high-risk"))
+                }))
+        ERR-INSUFFICIENT-DATA))
+
+(define-read-only (get-lending-trends (days-back uint))
+    (let ((start-block (let ((calc-start (- (/ stacks-block-height u144) days-back)))
+                          (if (< calc-start u0) u0 calc-start)))
+          (end-block (/ stacks-block-height u144)))
+        (ok {
+            period-start: start-block,
+            period-end: end-block,
+            days-analyzed: (- end-block start-block),
+            current-utilization: (calculate-pool-utilization),
+            avg-daily-volume: (if (> days-back u0) (/ (var-get total-interest-earned) days-back) u0)
+        })))
+
+(define-read-only (get-system-health)
+    (let ((pool-health (if (> (var-get pool-balance) u0) u100 u0))
+          (collateral-health (if (> (var-get total-collateral) (* (var-get pool-balance) u2)) u100 u50))
+          (loan-health (if (> (var-get total-loans-issued) u0)
+                          (- u100 (/ (* (var-get total-loans-defaulted) u100) (var-get total-loans-issued)))
+                          u100)))
+        (ok {
+            overall-health: (/ (+ pool-health collateral-health loan-health) u3),
+            pool-health: pool-health,
+            collateral-health: collateral-health,
+            loan-performance: loan-health,
+            analytics-active: (var-get analytics-initialized),
+            last-update: (var-get last-analytics-update)
+        })))
