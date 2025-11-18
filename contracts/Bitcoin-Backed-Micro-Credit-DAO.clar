@@ -11,6 +11,8 @@
 (define-constant ERR-INSUFFICIENT-INTEREST-PAYMENT (err u109))
 (define-constant ERR-MAX-EXTENSIONS-REACHED (err u110))
 (define-constant ERR-EXTENSION-NOT-ALLOWED (err u111))
+(define-constant ERR-INVALID-RISK-TIER (err u112))
+(define-constant ERR-ADJUSTMENT-LIMIT-EXCEEDED (err u113))
 
 ;; Data variables
 (define-data-var pool-balance uint u0)
@@ -495,3 +497,105 @@
             analytics-active: (var-get analytics-initialized),
             last-update: (var-get last-analytics-update)
         })))
+
+;; ==========================================
+;; DYNAMIC RISK-BASED COLLATERAL ADJUSTMENT SYSTEM
+;; ==========================================
+
+(define-data-var risk-adjustment-enabled bool true)
+(define-data-var max-collateral-discount-rate uint u3000)
+(define-data-var min-collateral-premium-rate uint u1000)
+
+(define-map risk-tier-multipliers
+    { tier: (string-ascii 10) }
+    { multiplier: uint })
+
+(define-private (get-borrower-risk-tier (composite-score uint))
+    (if (>= composite-score u800) "tier-1" 
+        (if (>= composite-score u600) "tier-2" 
+            (if (>= composite-score u400) "tier-3" "tier-4"))))
+
+(define-private (get-risk-multiplier (risk-tier (string-ascii 10)))
+    (let ((tier-multiplier (default-to { multiplier: u10000 } (map-get? risk-tier-multipliers { tier: risk-tier }))))
+        (get multiplier tier-multiplier)))
+
+(define-private (calculate-adjusted-collateral (loan-amount uint) (borrower-reputation uint))
+    (let ((base-collateral (calculate-required-collateral loan-amount))
+          (utilization (calculate-pool-utilization))
+          (reputation-bonus (if (> borrower-reputation u300) u2500 (if (> borrower-reputation u150) u5000 u7500)))
+          (market-adjustment (if (> utilization u7000) u11000 u10000))
+          (adjusted (/ (* base-collateral reputation-bonus market-adjustment) u100000000)))
+        (if (< adjusted base-collateral) adjusted base-collateral)))
+
+(define-public (initialize-risk-tiers)
+    (begin
+        (map-set risk-tier-multipliers { tier: "tier-1" } { multiplier: u7000 })
+        (map-set risk-tier-multipliers { tier: "tier-2" } { multiplier: u8500 })
+        (map-set risk-tier-multipliers { tier: "tier-3" } { multiplier: u9500 })
+        (map-set risk-tier-multipliers { tier: "tier-4" } { multiplier: u11500 })
+        (ok true)))
+
+(define-public (request-loan-with-dynamic-collateral (amount uint) (duration uint))
+    (let ((borrower-rep (default-to { score: u0 } (map-get? reputation { user: tx-sender })))
+          (current-collateral (default-to { locked: u0, available: u0 } (map-get? collateral-balances { user: tx-sender })))
+          (pool-utilization (calculate-pool-utilization))
+          (loan-interest-rate (calculate-interest-rate (get score borrower-rep) pool-utilization))
+          (dynamic-collateral-required (if (var-get risk-adjustment-enabled) 
+                                          (calculate-adjusted-collateral amount (get score borrower-rep))
+                                          (calculate-required-collateral amount))))
+        (asserts! (>= (get score borrower-rep) (var-get min-reputation)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= amount (var-get pool-balance)) ERR-INSUFFICIENT-BALANCE)
+        (asserts! (is-none (map-get? loans { borrower: tx-sender })) ERR-LOAN-EXISTS)
+        (asserts! (>= (get available current-collateral) dynamic-collateral-required) ERR-INSUFFICIENT-COLLATERAL)
+        (try! (as-contract (stx-transfer? amount (as-contract tx-sender) tx-sender)))
+        (map-set loans 
+            { borrower: tx-sender }
+            { amount: amount, 
+              due-height: (+ stacks-block-height duration), 
+              status: "active",
+              collateral-amount: dynamic-collateral-required,
+              interest-rate: loan-interest-rate,
+              accrued-interest: u0,
+              extensions-used: u0 })
+        (map-set collateral-balances
+            { user: tx-sender }
+            { locked: (+ (get locked current-collateral) dynamic-collateral-required),
+              available: (- (get available current-collateral) dynamic-collateral-required) })
+        (var-set pool-balance (- (var-get pool-balance) amount))
+        (var-set total-loans (+ (var-get total-loans) u1))
+        (ok true)))
+
+(define-read-only (get-dynamic-collateral-requirement (borrower principal) (amount uint))
+    (if (var-get risk-adjustment-enabled)
+        (let ((borrower-rep (default-to { score: u0 } (map-get? reputation { user: borrower }))))
+            (ok (calculate-adjusted-collateral amount (get score borrower-rep))))
+        (ok (calculate-required-collateral amount))))
+
+(define-read-only (get-borrower-risk-assessment (borrower principal))
+    (match (calculate-risk-score borrower)
+        risk-data (let ((composite (get composite-score risk-data))
+                        (tier (get-borrower-risk-tier composite)))
+                    (ok {
+                        risk-tier: tier,
+                        collateral-multiplier: (get-risk-multiplier tier),
+                        composite-score: composite
+                    }))
+        err-val (err err-val)))
+
+(define-public (set-risk-adjustment-status (enabled bool))
+    (begin
+        (var-set risk-adjustment-enabled enabled)
+        (ok true)))
+
+(define-public (set-max-collateral-discount (rate uint))
+    (begin
+        (asserts! (<= rate u5000) ERR-ADJUSTMENT-LIMIT-EXCEEDED)
+        (var-set max-collateral-discount-rate rate)
+        (ok true)))
+
+(define-read-only (get-risk-adjustment-config)
+    (ok {
+        enabled: (var-get risk-adjustment-enabled),
+        max-discount: (var-get max-collateral-discount-rate),
+        min-premium: (var-get min-collateral-premium-rate)
+    }))
